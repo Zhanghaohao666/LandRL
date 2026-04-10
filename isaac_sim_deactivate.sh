@@ -1,0 +1,5 @@
+# 恢复原来的环境变量
+export PYTHONPATH="${_OLD_PYTHONPATH}"
+export LD_LIBRARY_PATH="${_OLD_LD_LIBRARY_PATH}"
+unset _OLD_PYTHONPATH
+unset _OLD_LD_LIBRARY_PATH

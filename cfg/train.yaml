@@ -1,0 +1,117 @@
+defaults:
+  - _self_
+  - drone
+  - ppo
+  - sim
+
+headless: False
+device: "cuda:1"
+seed: 0
+
+# Total Training Length
+max_frame_num: 12e8 # max frame 
+eval_interval: 1000 # evaluate the policy for every N training steps
+save_interval: 1000
+
+eval:
+  record_video: true
+  render_interval: 2
+  video_backend: external_subprocess
+  video_num_envs: 1
+  video_max_steps:
+  video_timeout_sec: 1800
+  video_use_gpu_pipeline: # 默认镜像训练时的 sim.use_gpu_pipeline，优先保证“真实策略”回放一致性
+  video_headless: true
+  video_exploration_type: mode
+  video_camera_mode: fixed # 固定世界机位，更适合直接观察无人机相对平台的真实运动
+  video_follow_drone: false
+  video_device: # 默认镜像训练时的 device
+  video_eye: [0.0, 12.0, 8.0]
+  video_lookat: [0.0, 0.0, 1.2]
+  video_resolution: [1280, 720]
+  multi_seed_enabled: true
+  multi_seed_num_envs: 64
+  multi_seed_seed: 0
+  multi_seed_async: false # 先用同步模式，优先保证 64-case 评估链稳定可用
+  multi_seed_max_pending_jobs: 1
+  multi_seed_render_interval: 8
+  multi_seed_timeout_sec: 3600
+  multi_seed_headless: true
+  multi_seed_exploration_type: mode
+  multi_seed_camera_mode: fixed
+  multi_seed_log_video: false # 64-case 评估默认只保存 stats/details，不录总览视频
+  multi_seed_video_device: # 默认镜像训练时的 device（当前就是 cuda:0）
+  multi_seed_use_gpu_pipeline: # 默认镜像训练时的 sim.use_gpu_pipeline
+  multi_seed_use_flatcache: # 默认镜像训练时的 sim.use_flatcache
+  multi_seed_use_fabric: # 默认镜像训练时的 sim.use_fabric（如果配置存在）
+  multi_seed_use_gpu: # 默认镜像训练时的 sim.use_gpu
+  multi_seed_video_eye:
+  multi_seed_video_lookat:
+  multi_seed_video_resolution: [1600, 912] # 16 的倍数，避免 ffmpeg 录制时自动补边
+  multi_seed_max_steps:
+
+# Training Environment
+env:
+  num_envs: 1024 # Number of drones for training
+  max_episode_length: 1200
+  env_spacing: 8.0 
+  num_obstacles: 350
+  reset_horizontal_radius_range: [0.0, 3.0]
+  reset_spawn_height: 2.5
+
+env_dyn:
+  num_obstacles: 80 # set to zero if static env is needed
+  vel_range: [0.5, 1.5]
+  local_range: [5.0, 5.0, 4.5]
+
+viewer:
+  eye: [0., 40., 40.]
+  lookat: [0., 2.5, 0.]
+  resolution: [960, 720]
+
+wandb:
+  project: LandRL
+  name: LandRL_training
+  entity: 2454301555-huazhong-university-of-science-and-technology
+  mode: offline # online
+  run_id: #kw9xf9k9
+
+reward:
+  safety_static_alpha: 1.0
+  landing_hold_steps: 5
+  hover_target_height: 0.80
+  hover_xy_radius: 0.28
+  hover_height_tolerance: 0.20
+  hover_vxy_soft: 0.22
+  hover_vz_soft: 0.18
+  hover_vxy_hard: 0.45
+  hover_vz_hard: 0.35
+  hover_hold_steps: 10
+  soft_speed_xy: 1.2
+  soft_speed_vz_up: 0.8
+  soft_speed_vz_down: 0.9
+  hard_speed_xy: 2.5
+  hard_speed_vz_up: 1.5
+  hard_speed_vz_down: 2.2
+  enable_contact_force_tracking: false
+  contact_force_tracking_safe_env_limit: 256
+  contact_proxy_dz: 0.0
+  descent_align_radius: 0.45
+  descent_align_gain: 8.0
+  offcenter_descent_speed: 0.45
+  cross_speed_soft: 0.25
+  height_progress_align_floor: 0.10
+  flare_xy_radius: 0.30
+  flare_dz_abs: 0.20
+  flare_vxy_soft: 0.30
+  flare_vz_down_soft: 0.40
+  flare_vxy_hard: 0.55
+  flare_vz_down_hard: 0.70
+  contact_force_threshold: 1.0
+  hard_contact_force_threshold: 20.0
+  soft_contact_dz_abs: 0.22
+  soft_contact_xy_margin: 0.12
+  soft_contact_vxy: 0.45
+  soft_contact_vz_down: 0.45
+  hard_landing_vxy: 0.8
+  hard_landing_vz_down: 0.7
