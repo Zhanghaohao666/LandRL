@@ -67,6 +67,10 @@ env_dyn:
   num_obstacles: 80
   vel_range: [0.5, 1.5]
   local_range: [5.0, 5.0, 4.5]
+  platform_motion_enabled: true
+  platform_phase_randomize: true
+  platform_amp_xy: [3.0, 2.0]
+  platform_vel_xy: [0.25, 0.30]
 
 viewer:
   eye: [0., 40., 40.]

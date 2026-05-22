@@ -18,7 +18,7 @@ from omni.isaac.orbit.assets import RigidObject, RigidObjectCfg
 import time
 from omni_drones.utils.torch import quat_rotate_inverse
 from omni.isaac.orbit.sensors import Camera, CameraCfg
-from omni.isaac.core.prims import XFormPrim
+from omni.isaac.core.prims import RigidPrimView, XFormPrim
 from pxr import UsdGeom, Gf
 import omni.usd
 
@@ -39,8 +39,16 @@ class LandingEnv(IsaacEnv):
 
         super().__init__(cfg, cfg.headless)
         self.elapsed_time = 0.0
-        self.platform_world_pos = self.envs_positions + self.platform_center_local.view(1, 3)
-        self.platform_top_pos = self.platform_world_pos + self.platform_top_offset.view(1, 3)
+        self.platform_base_pos = self.envs_positions + self.platform_center_local.view(1, 3)
+        self.current_platform_pos = self.platform_base_pos.clone()
+        self.current_platform_vel = torch.zeros_like(self.current_platform_pos)
+        self.platform_world_pos = self.current_platform_pos.clone()
+        self.platform_top_pos = self.current_platform_pos + self.platform_top_offset.view(1, 3)
+        self.platform_top_vel = self.current_platform_vel.clone()
+        self.platform_orientation = torch.zeros(self.num_envs, 4, device=self.device)
+        self.platform_orientation[:, 0] = 1.0
+        self.platform_view = None
+        self.platform_env_to_view_idx = torch.arange(self.num_envs, device=self.device)
 
         # ===== 从 cfg.reward 读取着陆参数 =====
         reward_cfg = getattr(cfg, "reward", None)
@@ -160,6 +168,120 @@ class LandingEnv(IsaacEnv):
         self.current_smoothed_vel_diff = torch.zeros(self.num_envs, 1, 3, device=self.device)
         # 引用 VelocityEMATransform（由 train.py 注入）
         self.vel_ema_transform = None
+        self._initialize_platform_view()
+        all_env_ids = torch.arange(self.num_envs, device=self.device)
+        self._reset_platform_phase(all_env_ids)
+        self._update_platform_motion(env_ids=all_env_ids, write_to_sim=True)
+
+    def _cfg_vec3(self, cfg_node, name, fallback):
+        value = getattr(cfg_node, name, fallback) if cfg_node is not None else fallback
+        if value is None:
+            value = fallback
+        values = list(value)
+        if len(values) == 2:
+            values.append(0.0)
+        if len(values) != 3:
+            raise ValueError(f"{name} must contain 2 or 3 values, got {value}")
+        return torch.tensor(values, device=self.device, dtype=torch.float)
+
+    def _initialize_platform_view(self):
+        try:
+            self.platform_view = RigidPrimView(
+                prim_paths_expr="/World/envs/env_.*/PlatformOrigin/LandingPlatform",
+                name="landing_platform_view",
+                reset_xform_properties=False,
+                prepare_contact_sensors=False,
+            )
+            self.platform_view.initialize(self.sim._physics_sim_view)
+            env_to_view = torch.full((self.num_envs,), -1, device=self.device, dtype=torch.long)
+            for view_idx, prim_path in enumerate(getattr(self.platform_view, "_prim_paths", [])):
+                marker = "/env_"
+                start = prim_path.find(marker)
+                if start < 0:
+                    continue
+                start += len(marker)
+                end = prim_path.find("/", start)
+                try:
+                    env_idx = int(prim_path[start:end])
+                except ValueError:
+                    continue
+                if 0 <= env_idx < self.num_envs:
+                    env_to_view[env_idx] = view_idx
+            if (env_to_view < 0).any():
+                missing = (env_to_view < 0).nonzero().flatten()[:8].detach().cpu().tolist()
+                print(f"[LandRL_v2] warning: platform view missing env ids {missing}; physical platform motion may be partial.")
+            self.platform_env_to_view_idx = env_to_view
+            print(f"[LandRL_v2] dynamic platform view initialized: {self.platform_view.count} bodies.")
+        except Exception as exc:
+            self.platform_view = None
+            print(f"[LandRL_v2] warning: failed to initialize dynamic platform view: {exc}")
+
+    def _reset_platform_phase(self, env_ids: torch.Tensor):
+        if env_ids.numel() == 0:
+            return
+        if not self.platform_motion_enabled:
+            self.platform_phase[env_ids] = 0.0
+            return
+        if self.platform_phase_randomize:
+            self.platform_phase[env_ids] = torch.rand(
+                env_ids.numel(), 2, device=self.device
+            ) * (2.0 * np.pi)
+
+    def _write_platform_state_to_sim(self, env_ids: torch.Tensor | None = None):
+        if self.platform_view is None:
+            return
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        if env_ids.numel() == 0:
+            return
+        view_indices = self.platform_env_to_view_idx[env_ids]
+        valid = view_indices >= 0
+        if not valid.any():
+            return
+        env_ids = env_ids[valid]
+        view_indices = view_indices[valid]
+        positions = self.current_platform_pos[env_ids]
+        orientations = self.platform_orientation[env_ids]
+        velocities = torch.zeros(env_ids.numel(), 6, device=self.device)
+        velocities[:, :3] = self.current_platform_vel[env_ids]
+        self.platform_view.set_world_poses(
+            positions=positions,
+            orientations=orientations,
+            indices=view_indices,
+        )
+        self.platform_view.set_velocities(velocities, indices=view_indices)
+
+    def _update_platform_motion(self, env_ids: torch.Tensor | None = None, write_to_sim: bool = False):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        if env_ids.numel() == 0:
+            return
+
+        pos = self.platform_base_pos[env_ids].clone()
+        vel = torch.zeros_like(pos)
+        if self.platform_motion_enabled:
+            amp_xy = self.platform_amp_xy[:2].abs()
+            vel_xy = self.platform_vel_xy[:2].abs()
+            omega_xy = torch.where(
+                amp_xy > 1e-6,
+                vel_xy / amp_xy.clamp(min=1e-6),
+                torch.zeros_like(amp_xy),
+            )
+            phase = self.platform_phase[env_ids]
+            t = torch.tensor(float(self.elapsed_time), device=self.device)
+            angle = t * omega_xy.view(1, 2) + phase
+            pos[:, :2] += amp_xy.view(1, 2) * torch.sin(angle)
+            vel[:, :2] = vel_xy.view(1, 2) * torch.cos(angle)
+
+        self.current_platform_pos[env_ids] = pos
+        self.current_platform_vel[env_ids] = vel
+        self.platform_world_pos[env_ids] = pos
+        self.platform_top_pos[env_ids] = pos + self.platform_top_offset.view(1, 3)
+        self.platform_top_vel[env_ids] = vel
+        if hasattr(self, "target_pos"):
+            self.target_pos[env_ids] = self.platform_top_pos[env_ids].view(-1, 1, 3)
+        if write_to_sim:
+            self._write_platform_state_to_sim(env_ids)
 
     # ---- GPU direct pose API ----
     def _set_drone_root_poses_gpu(self, positions, orientations, env_ids):
@@ -177,6 +299,7 @@ class LandingEnv(IsaacEnv):
     # ---- Scene Design ----
     def _design_scene(self):
         # 平台参数
+        dyn_cfg = getattr(self.cfg, "env_dyn", None)
         self.platform_size_xy = (0.8, 0.8)
         self.platform_height = 0.10
         self.platform_clearance = 0.20
@@ -184,8 +307,10 @@ class LandingEnv(IsaacEnv):
             [0.0, 0.0, self.platform_height * 0.5 + self.platform_clearance],
             device=self.device, dtype=torch.float,
         )
-        self.platform_amp_xy = torch.tensor([3.0, 2.0, 0.0], device=self.device)
-        self.platform_vel_xy = torch.tensor([0.25, 0.30, 0.0], device=self.device)
+        self.platform_motion_enabled = bool(getattr(dyn_cfg, "platform_motion_enabled", True))
+        self.platform_phase_randomize = bool(getattr(dyn_cfg, "platform_phase_randomize", True))
+        self.platform_amp_xy = self._cfg_vec3(dyn_cfg, "platform_amp_xy", [3.0, 2.0, 0.0])
+        self.platform_vel_xy = self._cfg_vec3(dyn_cfg, "platform_vel_xy", [0.25, 0.30, 0.0])
         self.platform_phase = torch.zeros(self.num_envs, 2, device=self.device)
         self.platform_top_offset = torch.tensor(
             [0.0, 0.0, self.platform_height * 0.5], device=self.device
@@ -327,6 +452,8 @@ class LandingEnv(IsaacEnv):
     # ---- Reset ----
     def _reset_idx(self, env_ids: torch.Tensor):
         self.drone._reset_idx(env_ids, self.training)
+        self._reset_platform_phase(env_ids)
+        self._update_platform_motion(env_ids=env_ids, write_to_sim=True)
         self.reset_target(env_ids)
 
         # 初始位置：平台附近随机圆形分布
@@ -369,11 +496,13 @@ class LandingEnv(IsaacEnv):
 
         if not hasattr(self, "_debug_reset_printed"):
             self._debug_reset_printed = True
-            plat_pos_w = self.platform_world_pos
+            plat_pos_w = self.current_platform_pos
             eid = int(env_ids[0].item()) if env_ids.numel() > 0 else 0
             print("[debug] env", eid)
             print("[debug] cloner env position             =", self.envs_positions[eid].detach().cpu().numpy())
+            print("[debug] platform base pos (center)     =", self.platform_base_pos[eid].detach().cpu().numpy())
             print("[debug] computed platform_pos (center) =", plat_pos_w[eid].detach().cpu().numpy())
+            print("[debug] computed platform_vel          =", self.current_platform_vel[eid].detach().cpu().numpy())
             print("[debug] drone reset world_pos           =", pos[0, 0].detach().cpu().numpy())
 
         # 高度区间
@@ -409,6 +538,8 @@ class LandingEnv(IsaacEnv):
         self.stats["min_dz_abs"][env_ids] = init_dz_abs
 
     def _pre_sim_step(self, tensordict: TensorDictBase):
+        self.elapsed_time += float(self.dt)
+        self._update_platform_motion(write_to_sim=True)
         actions = tensordict[("agents", "action")]
         self.last_applied_motor_cmd[:] = actions.detach()
         # 阶段A1：从 VelocityEMATransform 写入的 tensordict 读取策略原始速度指令
@@ -423,7 +554,6 @@ class LandingEnv(IsaacEnv):
         self.drone.apply_action(actions)
 
     def _post_sim_step(self, tensordict: TensorDictBase):
-        self.elapsed_time += float(self.dt)
         return
 
     # ---- Core: 观测 + 奖励 + 终止 ----
@@ -435,8 +565,10 @@ class LandingEnv(IsaacEnv):
 
         # ---- 状态提取 ----
         platform_top = self.platform_top_pos                      # [N, 3]
+        platform_vel = self.platform_top_vel                      # [N, 3]
         pos_w = self.root_state[:, 0, :3]                         # [N, 3]
         vel_w = self.root_state[:, 0, 7:10]                       # [N, 3]
+        rel_vel_w = vel_w - platform_vel                          # [N, 3]
         rot = self.root_state[:, 0, 3:7]                          # [N, 4] quaternion
 
         # up 向量：body z-axis in world frame
@@ -451,9 +583,9 @@ class LandingEnv(IsaacEnv):
         drone_state = torch.cat([
             dx_dy,                          # [N, 2] 水平相对位置
             dz,                             # [N, 1] 垂直相对位置
-            vel_w[:, 0:1],                  # [N, 1] vx
-            vel_w[:, 1:2],                  # [N, 1] vy
-            vel_w[:, 2:3],                  # [N, 1] vz
+            rel_vel_w[:, 0:1],              # [N, 1] relative vx
+            rel_vel_w[:, 1:2],              # [N, 1] relative vy
+            rel_vel_w[:, 2:3],              # [N, 1] relative vz
             up_vec,                         # [N, 3] up vector
         ], dim=-1)                          # [N, 9]
         obs = {"state": drone_state}
@@ -462,8 +594,8 @@ class LandingEnv(IsaacEnv):
         horizontal_err = dx_dy.norm(dim=-1, keepdim=True)         # [N, 1]
         dz_abs = dz.abs()                                         # [N, 1]
         distance_3d = rpos.norm(dim=-1, keepdim=True)             # [N, 1]
-        vxy = vel_w[:, :2].norm(dim=-1, keepdim=True)             # [N, 1]
-        vz = vel_w[:, 2:3]                                        # [N, 1]
+        vxy = rel_vel_w[:, :2].norm(dim=-1, keepdim=True)         # [N, 1]
+        vz = rel_vel_w[:, 2:3]                                    # [N, 1]
         vz_down = (-vz).clamp(min=0)                              # [N, 1] 下降速度（正值）
         height_above = (pos_w[:, 2] - platform_top[:, 2]).unsqueeze(-1)  # [N, 1] 正=在上方
         up_z = up_vec[:, 2:3]                                     # [N, 1]
@@ -594,21 +726,23 @@ class LandingEnv(IsaacEnv):
         below_bound = (pos_w[:, 2].unsqueeze(-1) < (platform_top_z - 0.8))
         flipped = (up_z < 0.0)
 
-        # 硬着陆两级制：只在“进入触地区”的时刻判定，避免策略学到
-        # “还没真正接地，只是近地高速掠过也算硬着陆” 这种错误语义。
-        descending_into_touchdown_zone = touchdown_zone & (~self.prev_touchdown_zone) & (vz <= 0.0)
-
-        # 硬着陆两级制：进入触地区 + 平台内 + 速度过快
-        near_ground = (height_above < self.landing_dz_threshold) & above_surface
+        # 硬着陆两级制：在穿过真正近地面阈值时判定，而不是进入 18cm 触地区时判定。
+        crossing_landing_surface = (
+            on_platform_xy
+            & (self.prev_height_above >= self.landing_dz_threshold)
+            & (height_above <= self.landing_dz_threshold)
+            & (height_above > -max(self.landing_below_threshold, self.platform_height))
+            & (vz <= 0.0)
+        )
 
         # 中等硬着陆：惩罚但不终止（让策略从"差一点"中学习）
         moderate_speed = (vxy > self.hard_landing_vxy) | (vz_down > self.hard_landing_vz_down)
-        moderate_hard = descending_into_touchdown_zone & near_ground & moderate_speed
+        moderate_hard = crossing_landing_surface & moderate_speed
         self.reward[moderate_hard] -= self.hard_landing_penalty  # -8.0
 
         # 极端硬着陆：终止 + 更大惩罚
         extreme_speed = (vxy > self.hard_landing_vxy_extreme) | (vz_down > self.hard_landing_vz_extreme)
-        extreme_hard = descending_into_touchdown_zone & near_ground & extreme_speed
+        extreme_hard = crossing_landing_surface & extreme_speed
         self.reward[extreme_hard] -= self.hard_landing_penalty_extreme  # -20.0
 
         # 出界惩罚
