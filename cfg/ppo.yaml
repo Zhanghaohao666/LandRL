@@ -1,0 +1,18 @@
+algo:
+  feature_extractor:
+    learning_rate: 8e-5    # A1v2 微调：适度提高让加速度惩罚信号有效学习
+    dyn_obs_num: 5
+
+  actor:
+    learning_rate: 8e-5    # A1v2 微调：适度提高让加速度惩罚信号有效学习
+    clip_ratio: 0.1
+    action_limit: 1.2 # m/s
+
+  critic:
+    learning_rate: 2e-4    # A1v2 微调：critic 需要跟上新奖励分布
+    clip_ratio: 0.1
+
+  entropy_loss_coefficient: 5e-3 # v1=2e-3, 提高探索防止过早收敛
+  training_frame_num: 64
+  training_epoch_num: 4
+  num_minibatches: 16 # split into N minibatches

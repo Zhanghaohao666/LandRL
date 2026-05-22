@@ -1,0 +1,151 @@
+defaults:
+  - _self_
+  - drone
+  - ppo
+  - sim
+
+headless: True
+device: "cuda:0"
+seed: 0
+
+# Resume from a previous checkpoint (set to null to train from scratch)
+# 指向 A1 之前最后一次训练的 best checkpoint（rlw3e38m, 4/21 17:06）
+resume_checkpoint:
+
+# Total Training Length
+max_frame_num: 12e8
+eval_interval: 500                 # 日常训练间隔
+save_interval: 1000
+
+eval:
+  record_video: false
+  render_interval: 2
+  video_backend: external_subprocess
+  video_num_envs: 1
+  video_max_steps:
+  video_timeout_sec: 1800
+  video_use_gpu_pipeline:
+  video_headless: true
+  video_exploration_type: mode
+  video_camera_mode: fixed
+  video_follow_drone: false
+  video_device:
+  video_eye: [0.0, 12.0, 8.0]
+  video_lookat: [0.0, 0.0, 1.2]
+  video_resolution: [1280, 720]
+  multi_seed_enabled: false
+  multi_seed_num_envs: 64
+  multi_seed_seed: 0
+  multi_seed_async: false
+  multi_seed_max_pending_jobs: 1
+  multi_seed_render_interval: 8
+  multi_seed_timeout_sec: 3600
+  multi_seed_headless: true
+  multi_seed_exploration_type: mode
+  multi_seed_camera_mode: fixed
+  multi_seed_log_video: false
+  multi_seed_video_device:
+  multi_seed_use_gpu_pipeline:
+  multi_seed_use_flatcache:
+  multi_seed_use_fabric:
+  multi_seed_use_gpu:
+  multi_seed_video_eye:
+  multi_seed_video_lookat:
+  multi_seed_video_resolution: [1600, 912]
+  multi_seed_max_steps:
+
+# Training Environment
+env:
+  num_envs: 1024
+  max_episode_length: 750
+  env_spacing: 8.0
+  num_obstacles: 350
+  reset_horizontal_radius_range: [0.0, 3.0]
+  reset_spawn_height: 2.5
+
+env_dyn:
+  num_obstacles: 80
+  vel_range: [0.5, 1.5]
+  local_range: [5.0, 5.0, 4.5]
+
+viewer:
+  eye: [0., 40., 40.]
+  lookat: [0., 2.5, 0.]
+  resolution: [960, 720]
+
+wandb:
+  project: LandRL_v2
+  name: LandRL_v2_landing
+  entity: 2454301555-huazhong-university-of-science-and-technology
+  mode: offline
+  run_id:
+
+reward:
+  safety_static_alpha: 1.0
+
+  # ===== 着陆检测阈值（几何代理法）=====
+  landing_dz_threshold: 0.08        # 距平台面 8cm 内算"着陆"
+  landing_below_threshold: 0.03     # 允许最大穿透 3cm
+  landing_xy_margin: 0.35           # 平台中心 0.35m 内（平台 0.8m）
+  landing_vxy_soft: 0.25            # 着陆水平速度上限
+  landing_vz_soft: 0.20             # 着陆垂直速度上限
+  landing_hold_steps: 10            # 保持 10 步判定成功
+
+  # ===== 下降对齐 =====
+  descent_align_radius: 0.45        # 水平对齐半径
+  speed_proximity_height: 1.5       # 近地减速激活高度
+
+  # ===== 近地速度限制 =====
+  speed_vxy_limit: 0.35             # 近地水平速度软限（更早开始压横向速度）
+  speed_vz_limit: 0.40              # 近地下降速度软限（避免最后一段下冲）
+
+  # ===== 触地区软着陆 shaping =====
+  touchdown_zone_height: 0.18       # 进入平台上方 18cm 内，强约束“减速后再落”
+  touchdown_vxy_target: 0.18        # 触地区目标水平速度
+  touchdown_vz_target: 0.16         # 触地区目标下降速度
+
+  # ===== 硬着陆两级制 =====
+  hard_landing_vxy: 0.80            # 中等硬着陆水平速度阈值（更严格）
+  hard_landing_vz_down: 0.75        # 中等硬着陆下降速度阈值（更严格）
+  hard_landing_vxy_extreme: 1.60    # 极端硬着陆水平速度 → 终止
+  hard_landing_vz_extreme: 1.20     # 极端硬着陆下降速度 → 终止
+  hard_landing_penalty_extreme: 30.0 # 极端硬着陆惩罚（明显加大）
+
+  # ===== 奖励权重 =====
+  w_distance_progress: 5.0
+  w_potential: 1.5
+  w_descent: 5.0                     # A1v3: 微增下降引导
+  w_speed_shaping: 4.0
+  w_touchdown_smooth: 4.0
+  w_landed: 2.5
+  w_hold: 3.0
+  success_bonus: 80.0               # v1=150, 降低防崩塌
+  hard_landing_penalty: 12.0
+  flip_penalty: 10.0
+  oob_penalty: 5.0
+
+  # ===== 时间激励（鼓励快速降落）=====
+  w_time_penalty: 1.0               # 每步时间惩罚权重
+  time_bonus_ratio: 0.15            # 保留快速性，但降低“为抢时间而猛冲”的倾向
+
+  # ===== 速度约束（出界用）=====
+  soft_speed_xy: 1.2
+  soft_speed_vz_up: 0.8
+  soft_speed_vz_down: 0.9
+  hard_speed_xy: 2.5
+  hard_speed_vz_up: 1.5
+  hard_speed_vz_down: 2.2
+
+  # ===== 速度 EMA 平滑（策略输出层抗抖动）=====
+  # alpha=1.0 禁用（A1v2：不再依赖 EMA，让策略自己学平滑）
+  action_ema_alpha: 1.0
+
+  # ===== 阶段A1v3：全程抗抖动（物理加速度 + 动作平滑）=====
+  w_accel_penalty: 0.1               # 全程物理加速度惩罚
+  w_action_smooth: 0.15              # 全程动作平滑惩罚（抑制策略输出乒乓振荡）
+  w_bodyrate: 0.05                   # 角速度惩罚（proximity 加权）
+  w_upright: 0.15                    # upright 姿态惩罚（proximity 加权）
+
+  # ===== 接触力（禁用）=====
+  enable_contact_force_tracking: false
+  contact_force_tracking_safe_env_limit: 256

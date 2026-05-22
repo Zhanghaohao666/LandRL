@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime output
+outputs/
+wandb/
+.runtime_cache/
+logs/
+*.log
+
+# Model artifacts
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+
+# Local/editor files
+.env
+.venv/
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
