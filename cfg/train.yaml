@@ -93,7 +93,7 @@ reward:
   landing_xy_margin: 0.35           # 平台中心 0.35m 内（平台 0.8m）
   landing_vxy_soft: 0.25            # 着陆水平速度上限
   landing_vz_soft: 0.20             # 着陆垂直速度上限
-  landing_hold_steps: 10            # 保持 10 步判定成功
+  landing_hold_steps: 5             # 保持 5 步判定成功（动平台下相对速度抖动更频繁，10 步过严）
 
   # ===== 下降对齐 =====
   descent_align_radius: 0.45        # 水平对齐半径

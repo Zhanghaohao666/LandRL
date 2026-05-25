@@ -6,7 +6,7 @@ algo:
   actor:
     learning_rate: 8e-5    # A1v2 微调：适度提高让加速度惩罚信号有效学习
     clip_ratio: 0.1
-    action_limit: 1.2 # m/s
+    action_limit: 1.8 # m/s （动平台需要给 drone 留追踪 budget；平台 0.30 m/s + 自由速度 1.5 m/s）
 
   critic:
     learning_rate: 2e-4    # A1v2 微调：critic 需要跟上新奖励分布

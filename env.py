@@ -209,11 +209,25 @@ class LandingEnv(IsaacEnv):
                     env_to_view[env_idx] = view_idx
             if (env_to_view < 0).any():
                 missing = (env_to_view < 0).nonzero().flatten()[:8].detach().cpu().tolist()
+                if self.platform_motion_enabled:
+                    raise RuntimeError(
+                        "[LandRL_v2] dynamic platform motion is enabled, but "
+                        f"the platform view is missing env ids {missing}. "
+                        "Refusing to train against a moving logical target with a static physical platform."
+                    )
                 print(f"[LandRL_v2] warning: platform view missing env ids {missing}; physical platform motion may be partial.")
             self.platform_env_to_view_idx = env_to_view
             print(f"[LandRL_v2] dynamic platform view initialized: {self.platform_view.count} bodies.")
         except Exception as exc:
             self.platform_view = None
+            if self.platform_motion_enabled and isinstance(exc, RuntimeError):
+                raise
+            if self.platform_motion_enabled:
+                raise RuntimeError(
+                    "[LandRL_v2] dynamic platform motion is enabled, but the "
+                    "physical platform view failed to initialize. Refusing to "
+                    "train against a moving phantom target."
+                ) from exc
             print(f"[LandRL_v2] warning: failed to initialize dynamic platform view: {exc}")
 
     def _reset_platform_phase(self, env_ids: torch.Tensor):
@@ -262,8 +276,9 @@ class LandingEnv(IsaacEnv):
         if self.platform_motion_enabled:
             amp_xy = self.platform_amp_xy[:2].abs()
             vel_xy = self.platform_vel_xy[:2].abs()
+            moving_axis = amp_xy > 1e-6
             omega_xy = torch.where(
-                amp_xy > 1e-6,
+                moving_axis,
                 vel_xy / amp_xy.clamp(min=1e-6),
                 torch.zeros_like(amp_xy),
             )
@@ -271,7 +286,8 @@ class LandingEnv(IsaacEnv):
             t = torch.tensor(float(self.elapsed_time), device=self.device)
             angle = t * omega_xy.view(1, 2) + phase
             pos[:, :2] += amp_xy.view(1, 2) * torch.sin(angle)
-            vel[:, :2] = vel_xy.view(1, 2) * torch.cos(angle)
+            actual_vel_xy = amp_xy * omega_xy
+            vel[:, :2] = actual_vel_xy.view(1, 2) * torch.cos(angle)
 
         self.current_platform_pos[env_ids] = pos
         self.current_platform_vel[env_ids] = vel
@@ -370,8 +386,10 @@ class LandingEnv(IsaacEnv):
 
     # ---- Specs ----
     def _set_specs(self):
-        # 9D 观测：rpos(3) + vel(3) + up_vector(3)
-        observation_dim = 9
+        # 11D 观测：rpos(3) + rel_vel(3) + up_vector(3) + platform_vel_xy(2)
+        # 加 platform_vel_xy：让策略把 POMDP 还原成 MDP，能区分
+        # "drone 静止+平台静止" vs "drone 跟随+平台运动" 这两种 rel_vel 相同的状态。
+        observation_dim = 11
         self.observation_spec = CompositeSpec({
             "agents": CompositeSpec({
                 "observation": CompositeSpec({
@@ -579,7 +597,7 @@ class LandingEnv(IsaacEnv):
         dx_dy = rpos[:, :2]                                       # [N, 2]
         dz = rpos[:, 2].unsqueeze(-1)                             # [N, 1]
 
-        # ---- 9D 观测 ----
+        # ---- 11D 观测 ----
         drone_state = torch.cat([
             dx_dy,                          # [N, 2] 水平相对位置
             dz,                             # [N, 1] 垂直相对位置
@@ -587,7 +605,9 @@ class LandingEnv(IsaacEnv):
             rel_vel_w[:, 1:2],              # [N, 1] relative vy
             rel_vel_w[:, 2:3],              # [N, 1] relative vz
             up_vec,                         # [N, 3] up vector
-        ], dim=-1)                          # [N, 9]
+            platform_vel[:, 0:1],           # [N, 1] platform vx (绝对系)
+            platform_vel[:, 1:2],           # [N, 1] platform vy (绝对系)
+        ], dim=-1)                          # [N, 11]
         obs = {"state": drone_state}
 
         # ---- 奖励计算中间量 ----
@@ -608,12 +628,15 @@ class LandingEnv(IsaacEnv):
         current_potential = torch.exp(-1.5 * distance_3d)
         reward_potential = current_potential - self.prev_potential
 
-        # ===== 2. 下降奖励：水平对准后鼓励主动下降 =====
-        aligned = (horizontal_err < self.descent_align_radius)    # [N, 1] bool
+        # ===== 2. 下降奖励：全程鼓励降高，不再要求水平对齐才奖励 =====
+        # 旧版用 `aligned (horizontal_err<0.45)` 门控会诱导“先飞正上方再垂直降”
+        # 的失败模式（B1_redesign §1.3 原因 A）。动平台情况下危害更大——
+        # 平台在动 → 必须不停水平追踪才能解锁下降，导致迟迟不降。
+        # 现在改成全程发奖，让策略能在对角线上同时靠近+降高。
         descent_delta = (
             self.prev_height_above - height_above
         ).clamp(min=-0.15, max=0.15)
-        reward_descent = aligned.float() * descent_delta
+        reward_descent = descent_delta
 
         on_platform_xy = horizontal_err < self.landing_xy_margin
 
